@@ -5,11 +5,10 @@ import com.jdahms.semantic_search.entity.IndustryCode;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
-import org.springframework.stereotype.Repository;
 
 import java.util.List;
+import java.util.Optional;
 
-@Repository
 public interface CodeRepository extends JpaRepository<IndustryCode, Long> {
 
     @Query(value = """
@@ -21,4 +20,6 @@ public interface CodeRepository extends JpaRepository<IndustryCode, Long> {
         LIMIT :limit
         """, nativeQuery = true)
     List<CodeSimilarity> findSimilarCodes(@Param("queryEmbedding") String queryEmbedding, @Param("limit") int limit);
+
+    Optional<IndustryCode> findByCode(String code);
 }
