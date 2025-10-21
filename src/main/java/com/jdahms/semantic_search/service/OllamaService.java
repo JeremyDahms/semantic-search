@@ -1,10 +1,14 @@
 package com.jdahms.semantic_search.service;
 
+import com.jdahms.semantic_search.constant.VectorConstants;
 import com.jdahms.semantic_search.exception.OllamaApiException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 @Service
@@ -24,7 +28,13 @@ public class OllamaService {
         this.modelName = modelName;
     }
 
+    @Retryable(
+            retryFor = {RestClientException.class},
+            maxAttempts = 3,
+            backoff = @Backoff(delay = 1000, multiplier = 2.0)
+    )
     public float[] generateEmbedding(String text) {
+       logger.debug("Generating embedding for text (length: {})", text.length());
        OllamaRequest request = new OllamaRequest(modelName, text);
 
        try {
@@ -39,7 +49,17 @@ public class OllamaService {
                throw new OllamaApiException("Failed to generate embedding: Ollama returned null response");
            }
 
-           return response.embedding();
+           // Validate embedding dimension
+           float[] embedding = response.embedding();
+           if (embedding.length != VectorConstants.EMBEDDING_DIMENSION) {
+               logger.error("Invalid embedding dimension: expected {}, got {}",
+                       VectorConstants.EMBEDDING_DIMENSION, embedding.length);
+               throw new OllamaApiException(
+                       String.format("Invalid embedding dimension: expected %d, got %d",
+                               VectorConstants.EMBEDDING_DIMENSION, embedding.length));
+           }
+
+           return embedding;
        } catch (OllamaApiException e) {
            throw e;
        } catch (Exception e) {

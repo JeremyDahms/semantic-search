@@ -5,24 +5,26 @@ import com.jdahms.semantic_search.dto.CodeResponse;
 import com.jdahms.semantic_search.dto.CodeSimilarity;
 import com.jdahms.semantic_search.dto.CreateCodeRequest;
 import com.jdahms.semantic_search.dto.CsvUploadResult;
-import com.jdahms.semantic_search.dto.SearchResultResponse;
+import com.jdahms.semantic_search.dto.SearchResult;
 import com.jdahms.semantic_search.dto.UpdateCodeRequest;
 import com.jdahms.semantic_search.entity.IndustryCode;
 import com.jdahms.semantic_search.exception.CodeNotFoundException;
+import com.jdahms.semantic_search.exception.OllamaApiException;
 import com.jdahms.semantic_search.repository.CodeRepository;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -36,10 +38,12 @@ public class CodeService {
 
     private final CodeRepository codeRepository;
     private final OllamaService ollamaService;
+    private final CodeBatchService batchService;
 
-    public CodeService(CodeRepository codeRepository, OllamaService ollamaService) {
+    public CodeService(CodeRepository codeRepository, OllamaService ollamaService, CodeBatchService batchService) {
         this.codeRepository = codeRepository;
         this.ollamaService = ollamaService;
+        this.batchService = batchService;
     }
 
     @Transactional
@@ -75,7 +79,7 @@ public class CodeService {
     }
 
     @Transactional(readOnly = true)
-    public List<SearchResultResponse> searchCodes(String query, int limit) {
+    public List<SearchResult> searchCodes(String query, int limit) {
         // Generate query embedding
         float[] queryEmbedding = ollamaService.generateEmbedding(query);
         String embeddingStr = ollamaService.embeddingToString(queryEmbedding);
@@ -85,7 +89,7 @@ public class CodeService {
 
         // Map to response DTO
         return results.stream()
-                .map(result -> new SearchResultResponse(
+                .map(result -> new SearchResult(
                         result.id(),
                         result.code(),
                         result.description(),
@@ -98,6 +102,14 @@ public class CodeService {
     public CodeResponse updateCode(Long id, UpdateCodeRequest request) {
         IndustryCode code = codeRepository.findById(id)
                 .orElseThrow(() -> new CodeNotFoundException(id));
+
+        // Check if new code value already exists (unless it's unchanged)
+        if (!code.getCode().equals(request.code())) {
+            codeRepository.findByCode(request.code()).ifPresent(existing -> {
+                throw new IllegalArgumentException(
+                        String.format("Code '%s' already exists with ID %d", request.code(), existing.getId()));
+            });
+        }
 
         // Use Objects.equals() for null-safe comparison
         boolean descriptionChanged = !Objects.equals(code.getDescription(), request.description());
@@ -123,14 +135,14 @@ public class CodeService {
         codeRepository.delete(code);
     }
 
-    public CsvUploadResult uploadCodesFromCsv(MultipartFile file) throws Exception {
+    public CsvUploadResult uploadCodesFromCsv(MultipartFile file) {
         // Validation
         if (file.isEmpty()) {
             throw new IllegalArgumentException("File is empty");
         }
 
         String filename = file.getOriginalFilename();
-        if (filename == null || !filename.endsWith(".csv")) {
+        if (filename == null || !filename.toLowerCase().endsWith(".csv")) {
             throw new IllegalArgumentException("File must be a CSV");
         }
 
@@ -155,13 +167,11 @@ public class CodeService {
                 for (CSVRecord record : csvParser) {
                     rowCount++;
 
-                    // Enforce row limit
+                    // Enforce row limit - stop processing if limit exceeded
                     if (rowCount > VectorConstants.MAX_CSV_ROWS) {
-                        logger.warn("CSV upload exceeded maximum row limit of {}. Stopping processing.",
-                                VectorConstants.MAX_CSV_ROWS);
-                        throw new IllegalArgumentException(
-                                String.format("CSV file exceeds maximum allowed rows (%d). Only first %d rows will be processed.",
-                                        VectorConstants.MAX_CSV_ROWS, VectorConstants.MAX_CSV_ROWS));
+                        logger.warn("CSV file contains more than {} rows. Only first {} rows were processed.",
+                                VectorConstants.MAX_CSV_ROWS, VectorConstants.MAX_CSV_ROWS);
+                        break; // Stop processing, will save remaining batch below
                     }
 
                     try {
@@ -194,17 +204,31 @@ public class CodeService {
 
                         // Process batch when it reaches batch size
                         if (batch.size() >= VectorConstants.CSV_BATCH_SIZE) {
-                            saveBatch(batch);
+                            batchService.saveBatch(batch);
                             batch.clear();
 
                             // Add delay to prevent overwhelming Ollama service
-                            Thread.sleep(VectorConstants.OLLAMA_BATCH_DELAY_MS);
+                            try {
+                                Thread.sleep(VectorConstants.OLLAMA_BATCH_DELAY_MS);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                logger.warn("CSV upload interrupted during rate limiting delay");
+                                throw new RuntimeException("CSV upload was interrupted", e);
+                            }
 
                             logger.info("Processed {} codes so far ({} failed)...", totalProcessed, totalFailed);
                         }
 
+                    } catch (OllamaApiException e) {
+                        logger.error("Ollama API error processing row {}: {}", record.getRecordNumber(), e.getMessage());
+                        totalFailed++;
+                        // Continue processing other rows
+                    } catch (DataIntegrityViolationException e) {
+                        logger.error("Database constraint violation on row {}: {}", record.getRecordNumber(), e.getMessage());
+                        totalFailed++;
+                        // Continue processing other rows
                     } catch (Exception e) {
-                        logger.error("Error processing row {}: {}", record.getRecordNumber(), e.getMessage());
+                        logger.error("Unexpected error processing row {}: {}", record.getRecordNumber(), e.getMessage());
                         totalFailed++;
                         // Continue processing other rows
                     }
@@ -212,24 +236,18 @@ public class CodeService {
 
                 // Save remaining batch
                 if (!batch.isEmpty()) {
-                    saveBatch(batch);
+                    batchService.saveBatch(batch);
                     batch.clear();
                 }
 
                 logger.info("CSV upload completed: {} codes processed successfully, {} failed",
                         totalProcessed, totalFailed);
             }
+        } catch (IOException e) {
+            logger.error("Failed to read or parse CSV file: {}", e.getMessage(), e);
+            throw new IllegalArgumentException("Unable to read CSV file. The file may be corrupted or in an invalid format.", e);
         }
 
         return new CsvUploadResult(totalProcessed, totalFailed);
-    }
-
-    /**
-     * Save a batch of codes in a separate transaction.
-     * This allows partial success if some batches fail.
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    protected void saveBatch(List<IndustryCode> batch) {
-        codeRepository.saveAll(batch);
     }
 }

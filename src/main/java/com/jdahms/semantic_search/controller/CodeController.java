@@ -3,7 +3,7 @@ package com.jdahms.semantic_search.controller;
 import com.jdahms.semantic_search.dto.CodeResponse;
 import com.jdahms.semantic_search.dto.CreateCodeRequest;
 import com.jdahms.semantic_search.dto.CsvUploadResult;
-import com.jdahms.semantic_search.dto.SearchResultResponse;
+import com.jdahms.semantic_search.dto.SearchResult;
 import com.jdahms.semantic_search.dto.UpdateCodeRequest;
 import com.jdahms.semantic_search.dto.UploadResponse;
 import com.jdahms.semantic_search.service.CodeService;
@@ -50,7 +50,7 @@ public class CodeController {
     }
 
     @PostMapping("/upload-csv")
-    public ResponseEntity<UploadResponse> uploadCsv(@RequestParam("file") MultipartFile file) throws Exception {
+    public ResponseEntity<UploadResponse> uploadCsv(@RequestParam("file") MultipartFile file) {
         CsvUploadResult result = codeService.uploadCodesFromCsv(file);
         String message = String.format("CSV upload completed: %d successful, %d failed",
                 result.successful(), result.failed());
@@ -73,7 +73,7 @@ public class CodeController {
     }
 
     @GetMapping("/search")
-    public ResponseEntity<List<SearchResultResponse>> search(
+    public ResponseEntity<List<SearchResult>> search(
             @RequestParam @NotBlank @Size(min = 1, max = 500) String query,
             @RequestParam(defaultValue = "5") @Min(1) @Max(50) int limit) {
         return ResponseEntity.ok(codeService.searchCodes(query, limit));
